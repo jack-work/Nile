@@ -1,0 +1,414 @@
+// Package lifecycle implements the copt state machine and message pump.
+package lifecycle
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	nileotel "github.com/gluck/nile/pkg/otel"
+	"github.com/gluck/nile/pkg/protocol"
+	"github.com/gluck/nile/pkg/transport"
+	"github.com/gluck/nile/pkg/wal"
+)
+
+var tracer = otel.Tracer("github.com/gluck/nile/pkg/lifecycle")
+
+// Manager runs the copt lifecycle: initialization, message pump, retention, shutdown.
+type Manager struct {
+	name      string
+	dataDir   string
+	log       *wal.Log
+	transport transport.Transport
+	logger    *slog.Logger
+	metrics   *nileotel.Metrics
+
+	mu    sync.Mutex
+	state State
+	reqID uint64
+
+	// stopCh signals the pump loop to stop
+	stopCh chan struct{}
+	// doneCh is closed when the pump loop exits
+	doneCh chan struct{}
+
+	// Configuration
+	PollInterval   time.Duration
+	MessageTimeout time.Duration
+	MaxRetries     int
+}
+
+// Config holds configuration for the lifecycle manager.
+type Config struct {
+	Name           string
+	DataDir        string
+	Log            *wal.Log
+	Transport      transport.Transport
+	Logger         *slog.Logger
+	Metrics        *nileotel.Metrics
+	MessageTimeout time.Duration // default: 60s
+	MaxRetries     int           // default: 3
+}
+
+// New creates a new lifecycle manager.
+func New(cfg Config) *Manager {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	}
+
+	timeout := cfg.MessageTimeout
+	if timeout == 0 {
+		timeout = 60 * time.Second
+	}
+	retries := cfg.MaxRetries
+	if retries == 0 {
+		retries = 3
+	}
+
+	return &Manager{
+		name:           cfg.Name,
+		dataDir:        cfg.DataDir,
+		log:            cfg.Log,
+		transport:      cfg.Transport,
+		logger:         logger,
+		metrics:        cfg.Metrics,
+		state:          StateCreated,
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		PollInterval:   100 * time.Millisecond,
+		MessageTimeout: timeout,
+		MaxRetries:     retries,
+	}
+}
+
+// State returns the current lifecycle state.
+func (m *Manager) State() State {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state
+}
+
+// transition attempts a state change. Returns an error if invalid.
+func (m *Manager) transition(to State) error {
+	if !canTransition(m.state, to) {
+		return fmt.Errorf("lifecycle: invalid transition %s -> %s", m.state, to)
+	}
+	m.logger.Info("state transition", "from", m.state.String(), "to", to.String())
+	m.state = to
+	return nil
+}
+
+func (m *Manager) nextID() uint64 {
+	m.reqID++
+	return m.reqID
+}
+
+// send builds and sends a JSON-RPC request, returning the parsed status result.
+func (m *Manager) send(method string, params interface{}) (*protocol.StatusResult, error) {
+	req, err := protocol.NewRequest(m.nextID(), method, params)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := m.transport.Send(req)
+	if err != nil {
+		return nil, err
+	}
+
+	var result protocol.StatusResult
+	if err := resp.ParseResult(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Start initializes the neb and runs the message pump. Blocks until Stop is called or an error occurs.
+func (m *Manager) Start() error {
+	ctx := context.Background()
+
+	m.mu.Lock()
+	if err := m.transition(StateStarting); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	_, span := tracer.Start(ctx, "neb.init", trace.WithAttributes(
+		attribute.String("copt.name", m.name),
+	))
+
+	_, err := m.send(protocol.MethodInit, protocol.InitParams{Name: m.name})
+	if err != nil {
+		span.RecordError(err)
+		span.End()
+		m.mu.Lock()
+		m.transition(StateFailed)
+		m.mu.Unlock()
+		return fmt.Errorf("lifecycle: init failed: %w", err)
+	}
+	span.End()
+
+	m.mu.Lock()
+	if err := m.transition(StateIdle); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	return m.pump()
+}
+
+// Stop signals the pump to stop gracefully.
+func (m *Manager) Stop() {
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
+}
+
+// Wait blocks until the pump loop has exited.
+func (m *Manager) Wait() {
+	<-m.doneCh
+}
+
+// pump is the core message processing loop.
+func (m *Manager) pump() error {
+	defer close(m.doneCh)
+
+	ticker := time.NewTicker(m.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopCh:
+			return m.shutdown()
+		default:
+		}
+
+		m.mu.Lock()
+		currentState := m.state
+		m.mu.Unlock()
+
+		if currentState != StateIdle {
+			select {
+			case <-m.stopCh:
+				return m.shutdown()
+			case <-ticker.C:
+			}
+			continue
+		}
+
+		offset, payload, err := m.log.NextUnprocessed()
+		if err == wal.ErrNoMessages {
+			if m.log.RetentionExceeded() {
+				if err := m.doRetention(); err != nil {
+					return fmt.Errorf("lifecycle: retention: %w", err)
+				}
+			}
+
+			// Record stream gauges while idle
+			if m.metrics != nil {
+				ctx := context.Background()
+				m.metrics.RecordDepth(ctx, int64(m.log.Depth()))
+				m.metrics.RecordBytes(ctx, m.log.TotalBytes())
+			}
+
+			select {
+			case <-m.stopCh:
+				return m.shutdown()
+			case <-ticker.C:
+				continue
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("lifecycle: read message: %w", err)
+		}
+
+		if err := m.processMessage(offset, payload); err != nil {
+			return fmt.Errorf("lifecycle: process message: %w", err)
+		}
+
+		if m.log.RetentionExceeded() {
+			if err := m.doRetention(); err != nil {
+				return fmt.Errorf("lifecycle: retention: %w", err)
+			}
+		}
+	}
+}
+
+// processMessage sends a message to the neb with retry logic.
+// On exhausting retries, the message is dead-lettered.
+func (m *Manager) processMessage(offset uint64, payload []byte) error {
+	ctx := context.Background()
+	ctx, span := tracer.Start(ctx, "message.process", trace.WithAttributes(
+		attribute.String("copt.name", m.name),
+		attribute.Int64("message.offset", int64(offset)),
+	))
+	defer span.End()
+
+	m.mu.Lock()
+	if err := m.transition(StateProcessing); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	start := time.Now()
+	var lastErr error
+
+	for attempt := 0; attempt <= m.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 100ms, 200ms, 400ms...
+			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
+			time.Sleep(backoff)
+			m.logger.Warn("retrying message", "offset", offset, "attempt", attempt)
+		}
+
+		result, err := m.send(protocol.MethodMessage, protocol.MessageParams{
+			Offset: offset,
+			Data:   base64.StdEncoding.EncodeToString(payload),
+		})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Success
+		elapsed := time.Since(start)
+		if m.metrics != nil {
+			m.metrics.RecordProcessed(ctx)
+			m.metrics.RecordDuration(ctx, float64(elapsed.Milliseconds()))
+		}
+
+		if err := m.log.MarkProcessed(offset); err != nil {
+			return err
+		}
+
+		if result.PostProcess {
+			m.mu.Lock()
+			m.transition(StatePostProcessing)
+			m.mu.Unlock()
+
+			if err := m.log.MarkPostProcessed(offset); err != nil {
+				return err
+			}
+		}
+
+		m.mu.Lock()
+		m.transition(StateIdle)
+		m.mu.Unlock()
+
+		return nil
+	}
+
+	// Exhausted retries: dead-letter the message
+	span.RecordError(lastErr)
+	m.logger.Error("dead-lettering message", "offset", offset, "error", lastErr, "retries", m.MaxRetries)
+
+	if m.metrics != nil {
+		m.metrics.RecordDeadLettered(ctx)
+	}
+
+	if err := m.log.DeadLetter(offset, payload); err != nil {
+		return fmt.Errorf("dead letter: %w", err)
+	}
+
+	m.mu.Lock()
+	m.transition(StateIdle)
+	m.mu.Unlock()
+
+	return nil
+}
+
+// doRetention performs the drain -> snapshot -> retain -> truncate cycle.
+func (m *Manager) doRetention() error {
+	ctx := context.Background()
+	_, span := tracer.Start(ctx, "retention.cycle", trace.WithAttributes(
+		attribute.String("copt.name", m.name),
+	))
+	defer span.End()
+
+	m.mu.Lock()
+	if err := m.transition(StateDraining); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	m.logger.Info("retention: starting snapshot")
+
+	retainDir := filepath.Join(m.dataDir, "retain")
+	snapPath := filepath.Join(retainDir, fmt.Sprintf("snap-%d.wal", time.Now().UnixNano()))
+
+	if err := m.log.Snapshot(snapPath); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("snapshot: %w", err)
+	}
+
+	m.mu.Lock()
+	if err := m.transition(StateRetaining); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	m.logger.Info("retention: sending retain to neb")
+	_, err := m.send(protocol.MethodRetain, protocol.RetainParams{Snapshot: snapPath})
+	if err != nil {
+		span.RecordError(err)
+		m.mu.Lock()
+		m.transition(StateFailed)
+		m.mu.Unlock()
+		return fmt.Errorf("retain call: %w", err)
+	}
+
+	if err := m.log.Truncate(); err != nil {
+		m.mu.Lock()
+		m.transition(StateFailed)
+		m.mu.Unlock()
+		return fmt.Errorf("truncate: %w", err)
+	}
+
+	if m.metrics != nil {
+		m.metrics.RecordRetention(ctx)
+	}
+
+	m.logger.Info("retention: complete, log truncated")
+
+	m.mu.Lock()
+	m.transition(StateIdle)
+	m.mu.Unlock()
+
+	return nil
+}
+
+// shutdown sends a shutdown request to the neb.
+func (m *Manager) shutdown() error {
+	m.mu.Lock()
+	if m.state != StateIdle && m.state != StateStopping {
+		m.state = StateStopping
+	} else {
+		m.transition(StateStopping)
+	}
+	m.mu.Unlock()
+
+	m.logger.Info("shutting down neb")
+	m.send(protocol.MethodShutdown, nil)
+
+	m.mu.Lock()
+	m.state = StateStopped
+	m.mu.Unlock()
+
+	return nil
+}

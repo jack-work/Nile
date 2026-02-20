@@ -1,0 +1,70 @@
+package wal
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+)
+
+// Snapshot file header: [magic: 4 bytes "NILE"][version: uint32]
+const (
+	snapshotMagic      = "NILE"
+	snapshotVersion    = 1
+	snapshotHeaderSize = 8
+)
+
+var ErrInvalidSnapshot = errors.New("wal: invalid snapshot file")
+
+// writeSnapshotHeader writes the magic bytes and version to w.
+func writeSnapshotHeader(w io.Writer) error {
+	var hdr [snapshotHeaderSize]byte
+	copy(hdr[0:4], snapshotMagic)
+	binary.LittleEndian.PutUint32(hdr[4:8], snapshotVersion)
+	_, err := w.Write(hdr[:])
+	return err
+}
+
+// readSnapshotHeader reads and validates the snapshot header from r.
+// Returns the version number.
+func readSnapshotHeader(r io.Reader) (uint32, error) {
+	var hdr [snapshotHeaderSize]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvalidSnapshot, err)
+	}
+	if string(hdr[0:4]) != snapshotMagic {
+		return 0, fmt.Errorf("%w: bad magic", ErrInvalidSnapshot)
+	}
+	version := binary.LittleEndian.Uint32(hdr[4:8])
+	return version, nil
+}
+
+// snapshot concatenates all segment files into a single snapshot file at dest,
+// prefixed with a snapshot header. Uses io.Copy between *os.File which triggers
+// copy_file_range on Linux (kernel-level copy, no userspace buffering; on CoW
+// filesystems like btrfs this is a near-instant reflink).
+func (l *Log) snapshot(dest string) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return fmt.Errorf("wal: create snapshot dir: %w", err)
+	}
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("wal: create snapshot: %w", err)
+	}
+	defer f.Close()
+
+	if err := writeSnapshotHeader(f); err != nil {
+		return fmt.Errorf("wal: write snapshot header: %w", err)
+	}
+
+	for _, seg := range l.segments {
+		if err := seg.copyTo(f); err != nil {
+			return fmt.Errorf("wal: copy segment %s: %w", seg.path, err)
+		}
+	}
+
+	return f.Sync()
+}
