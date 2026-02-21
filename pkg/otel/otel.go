@@ -42,17 +42,11 @@ func Setup(cfg Config) (*Providers, error) {
 		return nil, fmt.Errorf("otel: create telemetry dir: %w", err)
 	}
 
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName("nile-"+cfg.CoptName),
-			attribute.String("copt.name", cfg.CoptName),
-		),
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName("nile-"+cfg.CoptName),
+		attribute.String("copt.name", cfg.CoptName),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("otel: create resource: %w", err)
-	}
 
 	// Traces
 	traceFile, err := os.OpenFile(

@@ -6,6 +6,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -77,7 +78,11 @@ func main() {
 		case "message":
 			var p messageParams
 			json.Unmarshal(req.Params, &p)
-			logf("MSG offset=%d data=%s", p.Offset, p.Data)
+			decoded, err := base64.StdEncoding.DecodeString(p.Data)
+			if err != nil {
+				decoded = []byte(p.Data) // show raw if not valid base64
+			}
+			logf("MSG offset=%d | %s", p.Offset, decoded)
 			respond(req.ID, statusResult{Status: "ok"})
 
 		case "retain":

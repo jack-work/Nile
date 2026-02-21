@@ -123,6 +123,8 @@ func (l *Log) Append(payload []byte) (uint64, error) {
 
 // NextUnprocessed returns the next message that hasn't been consumed.
 // Returns ErrNoMessages if all messages have been processed.
+// If caught up, re-scans the active segment and directory for records
+// appended by external processes (e.g. nile send).
 func (l *Log) NextUnprocessed() (uint64, []byte, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -133,7 +135,13 @@ func (l *Log) NextUnprocessed() (uint64, []byte, error) {
 
 	offset := l.cur.Consumed
 	if offset >= l.nextIdx {
-		return 0, nil, ErrNoMessages
+		// Re-scan for externally appended records before giving up
+		if err := l.refresh(); err != nil {
+			return 0, nil, fmt.Errorf("wal: refresh: %w", err)
+		}
+		if offset >= l.nextIdx {
+			return 0, nil, ErrNoMessages
+		}
 	}
 
 	entry := l.index[offset]
@@ -278,6 +286,86 @@ func (l *Log) Close() error {
 	for _, seg := range l.segments {
 		seg.close()
 	}
+	return nil
+}
+
+// refresh re-reads segments to discover records appended by external processes.
+// Called when the pump is caught up and polling for new messages.
+func (l *Log) refresh() error {
+	// Check for new segment files
+	indices, err := listSegments(l.dir)
+	if err != nil {
+		return err
+	}
+
+	// Track which segments we already know about
+	known := make(map[uint64]bool)
+	for _, seg := range l.segments {
+		known[seg.baseIndex] = true
+	}
+
+	// Add any new segments
+	for _, baseIdx := range indices {
+		if known[baseIdx] {
+			continue
+		}
+		path := filepath.Join(l.dir, segmentName(baseIdx))
+		records, err := (&segment{path: path}).readAll()
+		if err != nil {
+			return fmt.Errorf("read new segment %s: %w", path, err)
+		}
+
+		segIdx := len(l.segments)
+		info, _ := os.Stat(path)
+		var size int64
+		if info != nil {
+			size = info.Size()
+		}
+		l.segments = append(l.segments, &segment{
+			path:      path,
+			baseIndex: baseIdx,
+			size:      size,
+		})
+
+		for recIdx := range records {
+			l.index = append(l.index, indexEntry{
+				segIdx:    segIdx,
+				recordIdx: recIdx,
+			})
+		}
+		if count := uint64(len(records)); baseIdx+count > l.nextIdx {
+			l.nextIdx = baseIdx + count
+		}
+	}
+
+	// Re-read the last known segment to pick up appended records
+	if len(l.segments) > 0 {
+		lastSeg := l.segments[len(l.segments)-1]
+		records, err := (&segment{path: lastSeg.path}).readAll()
+		if err != nil {
+			return fmt.Errorf("re-read segment %s: %w", lastSeg.path, err)
+		}
+
+		knownCount := int(l.nextIdx - lastSeg.baseIndex)
+		if len(records) > knownCount {
+			// New records in this segment
+			segIdx := len(l.segments) - 1
+			for recIdx := knownCount; recIdx < len(records); recIdx++ {
+				l.index = append(l.index, indexEntry{
+					segIdx:    segIdx,
+					recordIdx: recIdx,
+				})
+			}
+			l.nextIdx = lastSeg.baseIndex + uint64(len(records))
+
+			// Update size
+			info, _ := os.Stat(lastSeg.path)
+			if info != nil {
+				lastSeg.size = info.Size()
+			}
+		}
+	}
+
 	return nil
 }
 

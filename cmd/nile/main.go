@@ -31,6 +31,10 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		cmdRun(os.Args[2:])
+	case "send":
+		cmdSend(os.Args[2:])
+	case "watch":
+		cmdWatch(os.Args[2:])
 	case "install":
 		cmdInstall(os.Args[2:])
 	case "status":
@@ -47,6 +51,8 @@ func usage() {
 
 Commands:
   run <name>       Run a copt (spawn neb, process messages)
+  send <name> <msg>  Append a message to a copt's stream
+  watch <name>     Live-tail a copt's stream state
   install <name>   Generate and enable a systemd user unit
   status <name>    Show copt status
 
@@ -298,6 +304,130 @@ func cmdRun(args []string) {
 	}
 
 	logger.Info("copt stopped")
+}
+
+func cmdSend(args []string) {
+	dataDir := ""
+	var messages []string
+
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--data-dir":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --data-dir requires a value")
+				os.Exit(1)
+			}
+			dataDir = args[i]
+		default:
+			messages = append(messages, args[i])
+		}
+		i++
+	}
+
+	if len(messages) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: nile send [--data-dir <path>] <name> <message> [message...]")
+		os.Exit(1)
+	}
+
+	name := messages[0]
+	messages = messages[1:]
+
+	if len(messages) == 0 {
+		fmt.Fprintln(os.Stderr, "error: at least one message required")
+		os.Exit(1)
+	}
+
+	if dataDir == "" {
+		dataDir = filepath.Join("/var/lib/nile", name)
+	}
+
+	wlog, err := wal.Open(dataDir, wal.DefaultOptions())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: open WAL: %v\n", err)
+		os.Exit(1)
+	}
+	defer wlog.Close()
+
+	for _, msg := range messages {
+		offset, err := wlog.Append([]byte(msg))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: append: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("sent offset=%d %s\n", offset, msg)
+	}
+}
+
+func cmdWatch(args []string) {
+	dataDir := ""
+	name := ""
+
+	i := 0
+	for i < len(args) {
+		switch args[i] {
+		case "--data-dir":
+			i++
+			if i >= len(args) {
+				fmt.Fprintln(os.Stderr, "error: --data-dir requires a value")
+				os.Exit(1)
+			}
+			dataDir = args[i]
+		default:
+			if name == "" {
+				name = args[i]
+			}
+		}
+		i++
+	}
+
+	if name == "" {
+		fmt.Fprintln(os.Stderr, "usage: nile watch [--data-dir <path>] <name>")
+		os.Exit(1)
+	}
+
+	if dataDir == "" {
+		dataDir = filepath.Join("/var/lib/nile", name)
+	}
+
+	fmt.Printf("watching %s (%s)\n\n", name, dataDir)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	lastDepth := int64(-1)
+	lastNext := int64(-1)
+
+	for {
+		select {
+		case <-sigCh:
+			return
+		default:
+		}
+
+		wlog, err := wal.Open(dataDir, wal.DefaultOptions())
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		depth := int64(wlog.Depth())
+		next := int64(wlog.NextIndex())
+		total := wlog.TotalBytes()
+
+		if depth != lastDepth || next != lastNext {
+			consumed := next - depth
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("%s  next=%-6d consumed=%-6d depth=%-4d bytes=%d\n",
+				ts, next, consumed, depth, total)
+			lastDepth = depth
+			lastNext = next
+		}
+
+		wlog.Close()
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 const systemdUnitTemplate = `[Unit]
