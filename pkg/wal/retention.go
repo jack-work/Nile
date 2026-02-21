@@ -75,8 +75,5 @@ func (l *Log) ReadDeadLetters() ([][]byte, error) {
 	}
 	defer f.Close()
 
-	seg := &segment{path: path}
-	_ = seg // readAll opens its own file handle
-	tmpSeg := &segment{path: path}
-	return tmpSeg.readAll()
+	return (&segment{path: path}).readAll()
 }

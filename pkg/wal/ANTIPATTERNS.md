@@ -26,12 +26,6 @@ Two processes can `wal.Open()` the same data directory simultaneously. `cmdStatu
 
 **Fix**: Use `flock` on a lock file in the data directory. Or make `cmdStatus` read-only (don't call `Open`, just parse segments directly).
 
-### Snapshot leaves partial file on failure [Severity: Medium]
-
-If `seg.copyTo()` fails mid-write, the partial snapshot file at `dest` is not removed. The retain directory accumulates corrupt snapshots.
-
-**Fix**: Write to a temp file, then rename atomically. Remove temp on error.
-
 ### No directory fsync after snapshot creation [Severity: Low]
 
 `f.Sync()` fsyncs file data but not the directory entry. On crash between file sync and directory sync, the snapshot may not appear in directory listings on recovery.
@@ -44,6 +38,16 @@ If `seg.copyTo()` fails mid-write, the partial snapshot file at `dest` is not re
 
 `encodeRecord` does two `Write` calls (header + payload). If the header succeeds but payload fails, the segment has a dangling 8-byte header. Recovery handles this via `ErrTruncated` (safe), but the segment's `size` field diverges from actual file size since the error is returned before `size` is incremented.
 
+### No maximum record size — corrupt segment can OOM [Severity: Medium]
+
+`decodeRecord()` allocates `make([]byte, length)` where `length` is read from the segment file with no upper bound. A corrupt or malicious segment with `length=0xFFFFFFFF` attempts a 4 GiB allocation.
+
+**Fix**: Enforce a maximum payload size and return `ErrRecordTooLarge`.
+
 ## Resolved
 
-*(none yet)*
+### Snapshot leaves partial file on failure — resolved
+Snapshot now writes to a temp file and renames atomically. On any error, the temp file is cleaned up. No partial snapshots left on disk.
+
+### No maximum record size — resolved
+Added `maxRecordPayload` (64 MiB) constant and `ErrRecordTooLarge`. `decodeRecord()` rejects records exceeding this limit before allocating.

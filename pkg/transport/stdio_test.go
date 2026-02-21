@@ -14,6 +14,13 @@ func TestStdioRoundTrip(t *testing.T) {
 	nebStdinR, nebStdinW := io.Pipe()
 	nebStdoutR, nebStdoutW := io.Pipe()
 
+	// Ensure the pipe writer closes even if the test fails early,
+	// so the simulated neb goroutine can exit.
+	t.Cleanup(func() {
+		nebStdinW.Close()
+		nebStdoutW.Close()
+	})
+
 	tr := NewStdio(nebStdinW, nebStdoutR)
 
 	// Simulate a neb: read request from stdin, write response to stdout

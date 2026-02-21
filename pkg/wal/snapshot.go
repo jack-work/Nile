@@ -46,25 +46,48 @@ func readSnapshotHeader(r io.Reader) (uint32, error) {
 // copy_file_range on Linux (kernel-level copy, no userspace buffering; on CoW
 // filesystems like btrfs this is a near-instant reflink).
 func (l *Log) snapshot(dest string) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("wal: create snapshot dir: %w", err)
 	}
 
-	f, err := os.Create(dest)
+	// Write to a temp file, then rename. This avoids leaving a partial
+	// snapshot on disk if the write fails midway.
+	tmp, err := os.CreateTemp(dir, ".snap-*.tmp")
 	if err != nil {
-		return fmt.Errorf("wal: create snapshot: %w", err)
+		return fmt.Errorf("wal: create snapshot temp: %w", err)
 	}
-	defer f.Close()
+	tmpPath := tmp.Name()
 
-	if err := writeSnapshotHeader(f); err != nil {
+	cleanup := func() {
+		tmp.Close()
+		os.Remove(tmpPath)
+	}
+
+	if err := writeSnapshotHeader(tmp); err != nil {
+		cleanup()
 		return fmt.Errorf("wal: write snapshot header: %w", err)
 	}
 
 	for _, seg := range l.segments {
-		if err := seg.copyTo(f); err != nil {
+		if err := seg.copyTo(tmp); err != nil {
+			cleanup()
 			return fmt.Errorf("wal: copy segment %s: %w", seg.path, err)
 		}
 	}
 
-	return f.Sync()
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("wal: sync snapshot: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("wal: close snapshot: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, dest); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("wal: rename snapshot: %w", err)
+	}
+	return nil
 }

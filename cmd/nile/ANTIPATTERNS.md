@@ -2,10 +2,6 @@
 
 ## Active
 
-### PID file write error silently ignored [Severity: Low]
-
-`os.WriteFile(pidFile, ...)` return value is not checked. If the write fails, `cmdStatus` incorrectly reports the copt as not running.
-
 ### cmdStatus opens WAL concurrently with running copt [Severity: High]
 
 `cmdStatus` calls `wal.Open()` on the same data directory that `cmdRun` has open. Since there's no file locking, `recover()` opens the last segment for writing, potentially corrupting it.
@@ -25,3 +21,12 @@ Added `requireValue()` bounds check before accessing `args[i]` for all flags.
 
 ### Numeric flag parse errors silently produce zero — resolved
 Added `parseInt()` and `parseInt64()` helpers that exit with a clear error message on bad input.
+
+### PID file write error silently ignored — resolved
+Now logs a warning on write failure.
+
+### ReadDeadLetters called after WAL Close / nil pointer — resolved
+Moved `ReadDeadLetters()` inside the `if err == nil` block, before `wlog.Close()`.
+
+### Signal goroutine orphaned on non-signal exit — resolved
+Signal goroutine now loops: first signal triggers graceful shutdown, second signal forces `os.Exit(1)`. `signal.Stop(sigCh)` called after `mgr.Start()` returns to deregister.

@@ -39,3 +39,9 @@ Replaced `time.After(m.PollInterval)` and `time.Sleep` with a single `time.Ticke
 
 ### State stuck in StateRetaining on truncate failure — resolved
 Added `transition(StateFailed)` before returning truncation errors in `doRetention()`.
+
+### Stop() double-close race — resolved
+Replaced `select/default` pattern with `sync.Once` to guarantee exactly one close of `stopCh`, eliminating the race between signal handler and pump goroutine.
+
+### Retry backoff ignores Stop() — resolved
+Replaced `time.Sleep(backoff)` with `select` on `time.After(backoff)` and `m.stopCh`, so the pump responds to `Stop()` during retry delays.

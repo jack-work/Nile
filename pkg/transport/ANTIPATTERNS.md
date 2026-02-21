@@ -2,12 +2,6 @@
 
 ## Active
 
-### No read timeout — pump hangs forever if neb stalls [Severity: High]
-
-`Stdio.Send()` calls `s.reader.Scan()` which blocks indefinitely. If the neb hangs between receiving a request and writing its response, the entire lifecycle manager goroutine is stuck forever. The manager's `stopCh` cannot interrupt this because the goroutine is blocked inside `Send()`, not in the pump's `select`.
-
-**Fix**: Accept a `context.Context` in `Send()`. Use a deadline-aware reader or a goroutine with select on context cancellation. Alternatively, set a read deadline on the underlying pipe fd.
-
 ### Close() doesn't close underlying I/O [Severity: Medium]
 
 `Close()` only sets `s.closed = true`. It does not close the writer or drain the scanner. Any goroutine blocked in `Scan()` when `Close()` is called remains blocked. Resources are not released.
@@ -22,4 +16,5 @@
 
 ## Resolved
 
-*(none yet)*
+### No read timeout — resolved
+Added `Timeout` field to `Stdio`. When set, `readLine()` reads in a goroutine with a deadline. On timeout, the transport is marked `broken` (scanner state is unrecoverable after a timeout). `cmd/nile/main.go` wires `--message-timeout` to `tr.Timeout`.

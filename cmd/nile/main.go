@@ -193,7 +193,9 @@ func cmdRun(args []string) {
 
 	// Write PID file
 	pidFile := filepath.Join(runDir, "nile.pid")
-	os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644)
+	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+		logger.Warn("write pid file", "error", err)
+	}
 	defer os.Remove(pidFile)
 
 	// Setup OTel
@@ -253,6 +255,7 @@ func cmdRun(args []string) {
 
 	// Create transport
 	tr := transport.NewStdio(nebStdin, nebStdout)
+	tr.Timeout = time.Duration(cfg.messageTimeout) * time.Second
 
 	// Create lifecycle manager
 	mgr := lifecycle.New(lifecycle.Config{
@@ -266,19 +269,26 @@ func cmdRun(args []string) {
 		MaxRetries:     cfg.maxRetries,
 	})
 
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
+	// Handle signals: first signal triggers graceful shutdown,
+	// second signal forces immediate exit.
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		sig := <-sigCh
 		logger.Info("received signal, shutting down", "signal", sig.String())
 		mgr.Stop()
+		// Second signal: force exit
+		sig = <-sigCh
+		logger.Error("received second signal, forcing exit", "signal", sig.String())
+		os.Exit(1)
 	}()
 
 	// Run the lifecycle (blocks until stopped)
 	if err := mgr.Start(); err != nil {
 		logger.Error("lifecycle error", "error", err)
 	}
+
+	signal.Stop(sigCh)
 
 	// Cleanup
 	tr.Close()
@@ -421,12 +431,12 @@ func cmdStatus(args []string) {
 		fmt.Printf("  next index: %d\n", wlog.NextIndex())
 		fmt.Printf("  depth: %d\n", wlog.Depth())
 		fmt.Printf("  total bytes: %d\n", wlog.TotalBytes())
-		wlog.Close()
-	}
 
-	// Show dead letter count
-	deadLetters, _ := wlog.ReadDeadLetters()
-	if len(deadLetters) > 0 {
-		fmt.Printf("  dead letters: %d\n", len(deadLetters))
+		deadLetters, _ := wlog.ReadDeadLetters()
+		if len(deadLetters) > 0 {
+			fmt.Printf("  dead letters: %d\n", len(deadLetters))
+		}
+
+		wlog.Close()
 	}
 }

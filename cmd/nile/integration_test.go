@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,12 +102,10 @@ func TestIntegrationMessageCycle(t *testing.T) {
 	cmd.Wait()
 	wlog.Close()
 
-	countData, err := os.ReadFile(filepath.Join(stateDir, "count"))
-	if err != nil {
-		t.Fatalf("read count: %v", err)
-	}
-	if string(countData) != "5" {
-		t.Errorf("count: got %q, want %q", string(countData), "5")
+	// Verify activity.log has the expected entries
+	msgCount := countLogEntries(t, filepath.Join(stateDir, "activity.log"), "MSG")
+	if msgCount != 5 {
+		t.Errorf("MSG entries in activity.log: got %d, want 5", msgCount)
 	}
 }
 
@@ -181,12 +181,14 @@ func TestIntegrationRetentionCycle(t *testing.T) {
 		t.Error("expected at least one snapshot file in retain/")
 	}
 
-	countData, err := os.ReadFile(filepath.Join(stateDir, "count"))
-	if err != nil {
-		t.Fatalf("read count: %v", err)
+	// Verify activity.log has MSG and RETAIN entries
+	msgCount := countLogEntries(t, filepath.Join(stateDir, "activity.log"), "MSG")
+	if msgCount == 0 {
+		t.Error("expected at least one MSG entry in activity.log")
 	}
-	if string(countData) != "4" {
-		t.Errorf("count: got %q, want %q", string(countData), "4")
+	retainCount := countLogEntries(t, filepath.Join(stateDir, "activity.log"), "RETAIN")
+	if retainCount == 0 {
+		t.Error("expected at least one RETAIN entry in activity.log")
 	}
 }
 
@@ -228,4 +230,29 @@ func TestEchoServiceProtocol(t *testing.T) {
 	if params["offset"].(float64) != 42 {
 		t.Errorf("offset: got %v", params["offset"])
 	}
+}
+
+// countLogEntries counts lines in a log file that contain the given prefix
+// after the timestamp (e.g. "MSG", "RETAIN", "INIT").
+func countLogEntries(t *testing.T, path, prefix string) int {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+
+	count := 0
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// Lines are formatted: "HH:MM:SS.mmm PREFIX ..."
+		line := scanner.Text()
+		if idx := strings.IndexByte(line, ' '); idx >= 0 {
+			rest := line[idx+1:]
+			if strings.HasPrefix(rest, prefix) {
+				count++
+			}
+		}
+	}
+	return count
 }

@@ -37,7 +37,8 @@ type Manager struct {
 	reqID uint64
 
 	// stopCh signals the pump loop to stop
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
 	// doneCh is closed when the pump loop exits
 	doneCh chan struct{}
 
@@ -168,13 +169,10 @@ func (m *Manager) Start() error {
 	return m.pump()
 }
 
-// Stop signals the pump to stop gracefully.
+// Stop signals the pump to stop gracefully. Safe to call multiple times
+// from multiple goroutines.
 func (m *Manager) Stop() {
-	select {
-	case <-m.stopCh:
-	default:
-		close(m.stopCh)
-	}
+	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
 // Wait blocks until the pump loop has exited.
@@ -271,7 +269,14 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 		if attempt > 0 {
 			// Exponential backoff: 100ms, 200ms, 400ms...
 			backoff := time.Duration(100<<uint(attempt-1)) * time.Millisecond
-			time.Sleep(backoff)
+			select {
+			case <-time.After(backoff):
+			case <-m.stopCh:
+				m.mu.Lock()
+				m.transition(StateIdle)
+				m.mu.Unlock()
+				return nil
+			}
 			m.logger.Warn("retrying message", "offset", offset, "attempt", attempt)
 		}
 

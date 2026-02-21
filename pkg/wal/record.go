@@ -10,9 +10,12 @@ import (
 // Record format: [length: uint32][crc32: uint32][payload: []byte]
 const headerSize = 8 // 4 bytes length + 4 bytes CRC32
 
+const maxRecordPayload = 64 * 1024 * 1024 // 64 MiB
+
 var (
-	ErrCorruptRecord = errors.New("wal: corrupt record (CRC mismatch)")
-	ErrTruncated     = errors.New("wal: truncated record")
+	ErrCorruptRecord  = errors.New("wal: corrupt record (CRC mismatch)")
+	ErrTruncated      = errors.New("wal: truncated record")
+	ErrRecordTooLarge = errors.New("wal: record exceeds maximum size")
 )
 
 // encodeRecord writes a length-prefixed, CRC32-checksummed record to w.
@@ -44,6 +47,10 @@ func decodeRecord(r io.Reader) ([]byte, error) {
 
 	length := binary.LittleEndian.Uint32(hdr[0:4])
 	checksum := binary.LittleEndian.Uint32(hdr[4:8])
+
+	if length > maxRecordPayload {
+		return nil, ErrRecordTooLarge
+	}
 
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {
