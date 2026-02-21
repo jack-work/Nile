@@ -55,7 +55,7 @@
             mkdir -p $NILE_DEMO_DIR/{state,retain,dead,run,stream}
             echo "Nile dev shell"
             echo ""
-            echo "  T1: nile run demo --binary $(command -v counter-service) --data-dir $NILE_DEMO_DIR"
+            echo "  T1: nile run demo --binary counter-service --data-dir $NILE_DEMO_DIR"
             echo "  T2: nile watch --data-dir $NILE_DEMO_DIR demo"
             echo "  T3: tail -f $NILE_DEMO_DIR/state/activity.log"
             echo ""

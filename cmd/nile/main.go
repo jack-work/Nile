@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -178,8 +179,13 @@ func cmdRun(args []string) {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("copt", cfg.name)
 
-	// Resolve binary to absolute path
-	binary, err := filepath.Abs(cfg.binary)
+	// Resolve binary to absolute path (supports bare names on $PATH)
+	binary, err := exec.LookPath(cfg.binary)
+	if err != nil {
+		logger.Error("resolve binary path", "error", err)
+		os.Exit(1)
+	}
+	binary, err = filepath.Abs(binary)
 	if err != nil {
 		logger.Error("resolve binary path", "error", err)
 		os.Exit(1)
