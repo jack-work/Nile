@@ -17,8 +17,8 @@ import (
 
 	nileotel "github.com/gluck/nile/pkg/otel"
 	"github.com/gluck/nile/pkg/protocol"
+	"github.com/gluck/nile/pkg/store"
 	"github.com/gluck/nile/pkg/transport"
-	"github.com/gluck/nile/pkg/wal"
 )
 
 var tracer = otel.Tracer("github.com/gluck/nile/pkg/lifecycle")
@@ -27,7 +27,7 @@ var tracer = otel.Tracer("github.com/gluck/nile/pkg/lifecycle")
 type Manager struct {
 	name      string
 	dataDir   string
-	log       *wal.Log
+	store     store.Store
 	transport transport.Transport
 	logger    *slog.Logger
 	metrics   *nileotel.Metrics
@@ -51,7 +51,7 @@ type Manager struct {
 type Config struct {
 	Name           string
 	DataDir        string
-	Log            *wal.Log
+	Store          store.Store
 	Transport      transport.Transport
 	Logger         *slog.Logger
 	Metrics        *nileotel.Metrics
@@ -78,7 +78,7 @@ func New(cfg Config) *Manager {
 	return &Manager{
 		name:           cfg.Name,
 		dataDir:        cfg.DataDir,
-		log:            cfg.Log,
+		store:          cfg.Store,
 		transport:      cfg.Transport,
 		logger:         logger,
 		metrics:        cfg.Metrics,
@@ -209,9 +209,9 @@ func (m *Manager) pump() error {
 			continue
 		}
 
-		offset, payload, err := m.log.NextUnprocessed()
-		if err == wal.ErrNoMessages {
-			if m.log.RetentionExceeded() {
+		offset, payload, err := m.store.NextUnprocessed()
+		if err == store.ErrNoMessages {
+			if m.store.RetentionExceeded() {
 				if err := m.doRetention(); err != nil {
 					return fmt.Errorf("lifecycle: retention: %w", err)
 				}
@@ -220,8 +220,8 @@ func (m *Manager) pump() error {
 			// Record stream gauges while idle
 			if m.metrics != nil {
 				ctx := context.Background()
-				m.metrics.RecordDepth(ctx, int64(m.log.Depth()))
-				m.metrics.RecordBytes(ctx, m.log.TotalBytes())
+				m.metrics.RecordDepth(ctx, int64(m.store.Depth()))
+				m.metrics.RecordBytes(ctx, m.store.TotalBytes())
 			}
 
 			select {
@@ -239,7 +239,7 @@ func (m *Manager) pump() error {
 			return fmt.Errorf("lifecycle: process message: %w", err)
 		}
 
-		if m.log.RetentionExceeded() {
+		if m.store.RetentionExceeded() {
 			if err := m.doRetention(); err != nil {
 				return fmt.Errorf("lifecycle: retention: %w", err)
 			}
@@ -291,7 +291,7 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 			m.metrics.RecordDuration(ctx, float64(elapsed.Milliseconds()))
 		}
 
-		if err := m.log.MarkProcessed(offset); err != nil {
+		if err := m.store.MarkProcessed(offset); err != nil {
 			return err
 		}
 
@@ -300,7 +300,7 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 			m.transition(StatePostProcessing)
 			m.mu.Unlock()
 
-			if err := m.log.MarkPostProcessed(offset); err != nil {
+			if err := m.store.MarkPostProcessed(offset); err != nil {
 				return err
 			}
 		}
@@ -320,7 +320,7 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 		m.metrics.RecordDeadLettered(ctx)
 	}
 
-	if err := m.log.DeadLetter(offset, payload); err != nil {
+	if err := m.store.DeadLetter(offset, payload); err != nil {
 		return fmt.Errorf("dead letter: %w", err)
 	}
 
@@ -351,7 +351,7 @@ func (m *Manager) doRetention() error {
 	retainDir := filepath.Join(m.dataDir, "retain")
 	snapPath := filepath.Join(retainDir, fmt.Sprintf("snap-%d.wal", time.Now().UnixNano()))
 
-	if err := m.log.Snapshot(snapPath); err != nil {
+	if err := m.store.Snapshot(snapPath); err != nil {
 		span.RecordError(err)
 		return fmt.Errorf("snapshot: %w", err)
 	}
@@ -373,7 +373,7 @@ func (m *Manager) doRetention() error {
 		return fmt.Errorf("retain call: %w", err)
 	}
 
-	if err := m.log.Truncate(); err != nil {
+	if err := m.store.Truncate(); err != nil {
 		m.mu.Lock()
 		m.transition(StateFailed)
 		m.mu.Unlock()

@@ -78,7 +78,7 @@ func TestIntegrationMessageCycle(t *testing.T) {
 	mgr := lifecycle.New(lifecycle.Config{
 		Name:      "test-counter",
 		DataDir:   dataDir,
-		Log:       wlog,
+		Store:     wlog,
 		Transport: tr,
 	})
 	mgr.PollInterval = 10 * time.Millisecond
@@ -151,7 +151,7 @@ func TestIntegrationRetentionCycle(t *testing.T) {
 	mgr := lifecycle.New(lifecycle.Config{
 		Name:      "test-retain",
 		DataDir:   dataDir,
-		Log:       wlog,
+		Store:     wlog,
 		Transport: tr,
 	})
 	mgr.PollInterval = 10 * time.Millisecond

@@ -8,10 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/gluck/nile/pkg/store"
 )
 
 var (
-	ErrNoMessages = errors.New("wal: no unprocessed messages")
+	// ErrNoMessages is an alias for store.ErrNoMessages so callers can
+	// use either wal.ErrNoMessages or store.ErrNoMessages interchangeably.
+	ErrNoMessages = store.ErrNoMessages
 	ErrClosed     = errors.New("wal: log is closed")
 )
 
@@ -31,6 +35,9 @@ func DefaultOptions() Options {
 		SegmentSize: 1024 * 1024,      // 1 MiB
 	}
 }
+
+// Compile-time check: *Log implements store.Store.
+var _ store.Store = (*Log)(nil)
 
 // Log is a segmented, append-only write-ahead log.
 type Log struct {

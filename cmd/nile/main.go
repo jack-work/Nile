@@ -258,7 +258,7 @@ func cmdRun(args []string) {
 	mgr := lifecycle.New(lifecycle.Config{
 		Name:           cfg.name,
 		DataDir:        cfg.dataDir,
-		Log:            wlog,
+		Store:          wlog,
 		Transport:      tr,
 		Logger:         logger,
 		Metrics:        metrics,

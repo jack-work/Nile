@@ -108,7 +108,7 @@ func TestMessagePump(t *testing.T) {
 	mgr := New(Config{
 		Name:      "test",
 		DataDir:   dir,
-		Log:       wl,
+		Store:     wl,
 		Transport: mt,
 	})
 	mgr.PollInterval = 10 * time.Millisecond
@@ -171,7 +171,7 @@ func TestRetentionCycle(t *testing.T) {
 	mgr := New(Config{
 		Name:      "test-retain",
 		DataDir:   dir,
-		Log:       wl,
+		Store:     wl,
 		Transport: mt,
 	})
 	mgr.PollInterval = 10 * time.Millisecond
@@ -225,7 +225,7 @@ func TestPostProcessing(t *testing.T) {
 	mgr := New(Config{
 		Name:      "test-pp",
 		DataDir:   dir,
-		Log:       wl,
+		Store:     wl,
 		Transport: mt,
 	})
 	mgr.PollInterval = 10 * time.Millisecond
@@ -287,7 +287,7 @@ func TestDeadLetterOnRetryExhaustion(t *testing.T) {
 	mgr := New(Config{
 		Name:       "test-deadletter",
 		DataDir:    dir,
-		Log:        wl,
+		Store:      wl,
 		Transport:  mt,
 		MaxRetries: 3,
 	})
