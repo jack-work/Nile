@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -20,6 +21,7 @@ type Stdio struct {
 	closed  bool
 	broken  bool           // set on timeout; scanner state is unrecoverable
 	Timeout time.Duration  // 0 means no timeout
+	Logger  *slog.Logger   // optional; logs raw JSON at Debug level
 }
 
 // NewStdio creates a new stdio transport.
@@ -58,6 +60,9 @@ func (s *Stdio) Send(req *protocol.Request) (*protocol.Response, error) {
 
 	// Write request + newline
 	data = append(data, '\n')
+	if s.Logger != nil {
+		s.Logger.Debug("transport tx", "method", req.Method, "id", req.ID, "json", string(data[:len(data)-1]))
+	}
 	if _, err := s.writer.Write(data); err != nil {
 		return nil, fmt.Errorf("transport: write: %w", err)
 	}
@@ -65,7 +70,13 @@ func (s *Stdio) Send(req *protocol.Request) (*protocol.Response, error) {
 	// Read response, with optional timeout
 	result, err := s.readLine()
 	if err != nil {
+		if s.Logger != nil {
+			s.Logger.Error("transport rx failed", "method", req.Method, "id", req.ID, "error", err)
+		}
 		return nil, err
+	}
+	if s.Logger != nil {
+		s.Logger.Debug("transport rx", "method", req.Method, "id", req.ID, "json", string(result))
 	}
 
 	resp, err := protocol.DecodeResponse(result)

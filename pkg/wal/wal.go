@@ -5,6 +5,7 @@ package wal
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,7 +55,8 @@ type Log struct {
 
 	// in-memory index: maps message offset -> segment index + record index within segment
 	// rebuilt on recovery
-	index []indexEntry
+	index  []indexEntry
+	logger *slog.Logger // optional
 }
 
 type indexEntry struct {
@@ -88,7 +90,21 @@ func Open(dataDir string, opts Options) (*Log, error) {
 		return nil, fmt.Errorf("wal: recovery: %w", err)
 	}
 
+	// Warn if the cursor is ahead of the data — likely a stale cursor
+	// from a previous session whose segments were deleted.
+	if l.cur.Consumed > l.nextIdx {
+		if l.logger != nil {
+			l.logger.Warn("cursor ahead of data, messages may have been lost",
+				"consumed", l.cur.Consumed, "next_index", l.nextIdx)
+		}
+	}
+
 	return l, nil
+}
+
+// SetLogger sets an optional logger for debug output.
+func (l *Log) SetLogger(logger *slog.Logger) {
+	l.logger = logger
 }
 
 // Append adds a message to the log and returns its offset.
@@ -148,14 +164,27 @@ func (l *Log) NextUnprocessed() (uint64, []byte, error) {
 	seg := l.segments[entry.segIdx]
 	records, err := seg.readAll()
 	if err != nil {
+		if l.logger != nil {
+			l.logger.Error("wal: readAll failed", "segment", seg.path, "error", err)
+		}
 		return 0, nil, fmt.Errorf("wal: read segment: %w", err)
 	}
 
 	if entry.recordIdx >= len(records) {
+		if l.logger != nil {
+			l.logger.Error("wal: index inconsistency",
+				"offset", offset, "record_idx", entry.recordIdx,
+				"records_in_segment", len(records), "segment", seg.path)
+		}
 		return 0, nil, fmt.Errorf("wal: index inconsistency at offset %d", offset)
 	}
 
-	return offset, records[entry.recordIdx], nil
+	payload := records[entry.recordIdx]
+	if l.logger != nil {
+		l.logger.Debug("wal: read message", "offset", offset, "payload_bytes", len(payload),
+			"segment", seg.path, "record_idx", entry.recordIdx, "records_in_segment", len(records))
+	}
+	return offset, payload, nil
 }
 
 // MarkProcessed advances the consumed cursor past the given offset.
@@ -291,6 +320,7 @@ func (l *Log) Close() error {
 
 // refresh re-reads segments to discover records appended by external processes.
 // Called when the pump is caught up and polling for new messages.
+// Dear Agent:  If this function gets any longer, refactor it so that it stays below 75 or so lines.
 func (l *Log) refresh() error {
 	// Check for new segment files
 	indices, err := listSegments(l.dir)
@@ -313,6 +343,10 @@ func (l *Log) refresh() error {
 		records, err := (&segment{path: path}).readAll()
 		if err != nil {
 			return fmt.Errorf("read new segment %s: %w", path, err)
+		}
+
+		if l.logger != nil {
+			l.logger.Info("wal: discovered new segment", "path", path, "records", len(records), "base_index", baseIdx)
 		}
 
 		segIdx := len(l.segments)
@@ -348,6 +382,12 @@ func (l *Log) refresh() error {
 
 		knownCount := int(l.nextIdx - lastSeg.baseIndex)
 		if len(records) > knownCount {
+			newCount := len(records) - knownCount
+			if l.logger != nil {
+				l.logger.Info("wal: discovered new records", "segment", lastSeg.path,
+					"new", newCount, "total", len(records), "previous", knownCount)
+			}
+
 			// New records in this segment
 			segIdx := len(l.segments) - 1
 			for recIdx := knownCount; recIdx < len(records); recIdx++ {

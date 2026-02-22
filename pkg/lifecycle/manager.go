@@ -137,6 +137,7 @@ func (m *Manager) send(method string, params interface{}) (*protocol.StatusResul
 func (m *Manager) Start() error {
 	ctx := context.Background()
 
+	// Dear Agent, Maybe should go into it's own scope so we can use defer
 	m.mu.Lock()
 	if err := m.transition(StateStarting); err != nil {
 		m.mu.Unlock()
@@ -158,7 +159,9 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("lifecycle: init failed: %w", err)
 	}
 	span.End()
+	m.logger.Info("neb init complete, starting pump")
 
+	// Dear Agent, same here as above with the defer
 	m.mu.Lock()
 	if err := m.transition(StateIdle); err != nil {
 		m.mu.Unlock()
@@ -208,6 +211,9 @@ func (m *Manager) pump() error {
 		}
 
 		offset, payload, err := m.store.NextUnprocessed()
+		if err != nil && err != store.ErrNoMessages {
+			m.logger.Error("failed to read next message", "error", err)
+		}
 		if err == store.ErrNoMessages {
 			if m.store.RetentionExceeded() {
 				if err := m.doRetention(); err != nil {
@@ -233,6 +239,8 @@ func (m *Manager) pump() error {
 			return fmt.Errorf("lifecycle: read message: %w", err)
 		}
 
+		m.logger.Info("dequeued message", "offset", offset, "payload_bytes", len(payload))
+
 		if err := m.processMessage(offset, payload); err != nil {
 			return fmt.Errorf("lifecycle: process message: %w", err)
 		}
@@ -252,6 +260,7 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 	ctx, span := tracer.Start(ctx, "message.process", trace.WithAttributes(
 		attribute.String("copt.name", m.name),
 		attribute.Int64("message.offset", int64(offset)),
+		attribute.Int("message.payload_bytes", len(payload)),
 	))
 	defer span.End()
 
@@ -261,6 +270,8 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 		return err
 	}
 	m.mu.Unlock()
+
+	encoded := base64.StdEncoding.EncodeToString(payload)
 
 	start := time.Now()
 	var lastErr error
@@ -277,20 +288,28 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 				m.mu.Unlock()
 				return nil
 			}
-			m.logger.Warn("retrying message", "offset", offset, "attempt", attempt)
+			m.logger.Warn("retrying message", "offset", offset, "attempt", attempt, "last_error", lastErr)
 		}
+
+		m.logger.Debug("sending message to neb", "offset", offset, "attempt", attempt, "data_b64", encoded)
 
 		result, err := m.send(protocol.MethodMessage, protocol.MessageParams{
 			Offset: offset,
-			Data:   base64.StdEncoding.EncodeToString(payload),
+			Data:   encoded,
 		})
 		if err != nil {
 			lastErr = err
+			m.logger.Warn("neb send failed", "offset", offset, "attempt", attempt, "error", err)
 			continue
 		}
 
 		// Success
 		elapsed := time.Since(start)
+		m.logger.Info("message processed", "offset", offset, "status", result.Status, "elapsed_ms", elapsed.Milliseconds())
+		span.SetAttributes(
+			attribute.String("neb.status", result.Status),
+			attribute.Int64("message.elapsed_ms", elapsed.Milliseconds()),
+		)
 		if m.metrics != nil {
 			m.metrics.RecordProcessed(ctx)
 			m.metrics.RecordDuration(ctx, float64(elapsed.Milliseconds()))
@@ -299,6 +318,7 @@ func (m *Manager) processMessage(offset uint64, payload []byte) error {
 		if err := m.store.MarkProcessed(offset); err != nil {
 			return err
 		}
+		m.logger.Debug("cursor advanced", "offset", offset, "consumed", offset+1)
 
 		if result.PostProcess {
 			m.mu.Lock()

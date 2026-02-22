@@ -234,6 +234,7 @@ func cmdRun(args []string) {
 		logger.Error("open WAL", "error", err)
 		os.Exit(1)
 	}
+	wlog.SetLogger(logger)
 	defer wlog.Close()
 
 	// Spawn neb process
@@ -268,6 +269,7 @@ func cmdRun(args []string) {
 	// Create transport
 	tr := transport.NewStdio(nebStdin, nebStdout)
 	tr.Timeout = time.Duration(cfg.messageTimeout) * time.Second
+	tr.Logger = logger
 
 	// Create lifecycle manager
 	mgr := lifecycle.New(lifecycle.Config{
