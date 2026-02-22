@@ -19,17 +19,15 @@ var (
 )
 
 // encodeRecord writes a length-prefixed, CRC32-checksummed record to w.
+// The header and payload are written in a single Write call so that the
+// entire record is atomic when w is an O_APPEND file descriptor. This
+// prevents interleaving when multiple processes append concurrently.
 func encodeRecord(w io.Writer, payload []byte) (int, error) {
-	var hdr [headerSize]byte
-	binary.LittleEndian.PutUint32(hdr[0:4], uint32(len(payload)))
-	binary.LittleEndian.PutUint32(hdr[4:8], crc32.ChecksumIEEE(payload))
-
-	n, err := w.Write(hdr[:])
-	if err != nil {
-		return n, err
-	}
-	n2, err := w.Write(payload)
-	return n + n2, err
+	buf := make([]byte, headerSize+len(payload))
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(buf[4:8], crc32.ChecksumIEEE(payload))
+	copy(buf[headerSize:], payload)
+	return w.Write(buf)
 }
 
 // decodeRecord reads a single record from r. Returns the payload or an error.

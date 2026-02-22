@@ -34,10 +34,6 @@ Two processes can `wal.Open()` the same data directory simultaneously. `cmdStatu
 
 `saveCursor()` writes to `.tmp` then renames. If the process crashes after write but before rename, the stale `.tmp` persists. Harmless (next save overwrites it) but untidy.
 
-### Partial header write leaves segment dirty [Severity: Low]
-
-`encodeRecord` does two `Write` calls (header + payload). If the header succeeds but payload fails, the segment has a dangling 8-byte header. Recovery handles this via `ErrTruncated` (safe), but the segment's `size` field diverges from actual file size since the error is returned before `size` is incremented.
-
 ### No maximum record size — corrupt segment can OOM [Severity: Medium]
 
 `decodeRecord()` allocates `make([]byte, length)` where `length` is read from the segment file with no upper bound. A corrupt or malicious segment with `length=0xFFFFFFFF` attempts a 4 GiB allocation.
@@ -51,3 +47,6 @@ Snapshot now writes to a temp file and renames atomically. On any error, the tem
 
 ### No maximum record size — resolved
 Added `maxRecordPayload` (64 MiB) constant and `ErrRecordTooLarge`. `decodeRecord()` rejects records exceeding this limit before allocating.
+
+### Concurrent append corruption via split writes — resolved in 1bc7992c7249
+`encodeRecord` previously did two `Write()` calls (header then payload). When multiple processes appended concurrently to an O_APPEND fd, the writes could interleave (e.g., header A, header B, payload A, payload B), producing corrupt records. Fixed by combining header + payload into a single buffer and issuing one `Write()` call, which is atomic under O_APPEND for writes ≤ PIPE_BUF (4096 bytes on Linux). Records larger than PIPE_BUF are still theoretically vulnerable but in practice are safe on local filesystems.
