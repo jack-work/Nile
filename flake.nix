@@ -37,6 +37,8 @@
           subPackages = [ "examples/counter-service" ];
         };
 
+        packages.nile-demo = pkgs.writeScriptBin "nile-demo" (builtins.readFile ./scripts/nile-demo);
+
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             go
@@ -47,19 +49,14 @@
           packages = [
             self.packages.${system}.default
             self.packages.${system}.counter-service
+            self.packages.${system}.nile-demo
           ];
 
           NILE_DEMO_DIR = "/tmp/nile-demo";
 
           shellHook = ''
             mkdir -p $NILE_DEMO_DIR/{state,retain,dead,run,stream}
-            echo "Nile dev shell"
-            echo ""
-            echo "  T1: nile run demo --binary counter-service --data-dir $NILE_DEMO_DIR"
-            echo "  T2: nile watch --data-dir $NILE_DEMO_DIR demo"
-            echo "  T3: tail -f $NILE_DEMO_DIR/state/activity.log"
-            echo ""
-            echo "  Send: nile send --data-dir $NILE_DEMO_DIR demo \"hello world\""
+            echo "Nile dev shell — run 'nile-demo help' to get started"
           '';
         };
       }

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="${NILE_DEMO_DIR:-/tmp/nile-demo}"
+PIDFILE="$DIR/run/nile.pid"
+
+ensure_dirs() {
+  mkdir -p "$DIR"/{state,retain,dead,run,stream}
+}
+
+is_running() {
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+cmd_start() {
+  ensure_dirs
+  if is_running; then
+    echo "already running (pid $(cat "$PIDFILE"))"
+    return
+  fi
+  local bin
+  bin="$(command -v counter-service 2>/dev/null || echo "")"
+  if [ -z "$bin" ]; then
+    echo "error: counter-service not on PATH (are you in nix develop?)" >&2
+    exit 1
+  fi
+  nile run demo --binary "$bin" --data-dir "$DIR" 2>"$DIR/runtime.log" &
+  local pid=$!
+  # wait briefly for pid file
+  for _ in 1 2 3 4 5; do
+    [ -f "$PIDFILE" ] && break
+    sleep 0.2
+  done
+  echo "started (pid $pid)"
+}
+
+cmd_stop() {
+  if ! is_running; then
+    echo "not running"
+    return
+  fi
+  local pid
+  pid="$(cat "$PIDFILE")"
+  kill "$pid" 2>/dev/null
+  echo "stopped (pid $pid)"
+}
+
+cmd_reset() {
+  cmd_stop 2>/dev/null || true
+  sleep 0.5
+  rm -rf "$DIR"/{state,retain,dead,run,stream}/*
+  rm -f "$DIR/cursor.json"
+  ensure_dirs
+  echo "reset $DIR"
+}
+
+cmd_send() {
+  if [ $# -eq 0 ]; then
+    echo "usage: nile-demo send <message> [message...]" >&2
+    exit 1
+  fi
+  ensure_dirs
+  if ! is_running; then
+    echo "warning: copt not running, messages will be queued" >&2
+  fi
+  nile send --data-dir "$DIR" demo "$@"
+}
+
+cmd_log() {
+  ensure_dirs
+  nile watch --data-dir "$DIR" demo
+}
+
+cmd_output() {
+  local logfile="$DIR/state/activity.log"
+  ensure_dirs
+  touch "$logfile"
+  tail -f "$logfile"
+}
+
+cmd_runtime_log() {
+  local logfile="$DIR/runtime.log"
+  ensure_dirs
+  touch "$logfile"
+  tail -f "$logfile"
+}
+
+cmd_status() {
+  if is_running; then
+    echo "running (pid $(cat "$PIDFILE"))"
+  else
+    echo "not running"
+  fi
+}
+
+case "${1:-help}" in
+  start)       cmd_start ;;
+  stop)        cmd_stop ;;
+  reset)       cmd_reset ;;
+  send)        shift; cmd_send "$@" ;;
+  log)         cmd_log ;;
+  output)      cmd_output ;;
+  runtime-log) cmd_runtime_log ;;
+  status)      cmd_status ;;
+  *)
+    cat <<'USAGE'
+nile-demo — interactive demo harness
+
+  start       Start the demo copt (background)
+  stop        Stop it
+  reset       Stop + clear all data
+  status      Check if running
+  send <msg>  Send a message (queues if not running)
+  log         Live-tail WAL state (depth, cursor)
+  output      Live-tail neb activity log
+  runtime-log Live-tail runtime stderr (JSON logs)
+
+Typical session (4 terminals):
+  T1: nile-demo start && nile-demo output
+  T2: nile-demo log
+  T3: nile-demo runtime-log
+  T4: nile-demo send "hello world"
+USAGE
+    ;;
+esac
