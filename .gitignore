@@ -1,2 +1,5 @@
 # Built binary
 /nile
+
+# nix build output symlink
+/result
